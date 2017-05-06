@@ -33,6 +33,7 @@ import collections
 import sys
 import csv
 import tempfile
+import re
 
 
 yt_dl_path = '/usr/local/anaconda3/bin/youtube-dl'
@@ -63,23 +64,40 @@ class FrameAnnosInfo(object):
     self.class_infos = {}
     self.obj_infos = {}
 
-  def add_class_info(self, class_id, present):
+  def add_class_info(self, class_id, class_name, present):
     class_id = int(class_id)
     if class_id in self.class_infos:
       raise Exception("Class '%d' has already been added to %s (%d)" % (class_id, self.yt_id, self.timestamp))
-    self.class_infos[class_id] = {'present':present}
+    self.class_infos[class_id] = {'class_name':class_name, 'present':present}
 
-  def add_obj_info(self, class_id, present, obj_id, xmin, xmax, ymin, ymax):
+  def add_obj_info(self, class_id, class_name, present, obj_id, xmin, xmax, ymin, ymax):
     obj_id = int(obj_id)
     class_id = int(class_id)
     obj_key = (obj_id, class_id)
     if obj_key in self.obj_infos:
       raise Exception("Object '%s' has already been added to %s (%d)" % (str(obj_key), self.yt_id, self.timestamp))
-    self.obj_infos[obj_key] = {'present':present, 'coords':(float(xmin), float(xmax), float(ymin), float(ymax))}
+    self.obj_infos[obj_key] = {'class_name':class_name, 'present':present, \
+                               'coords':(float(xmin), float(xmax), float(ymin), float(ymax))}
 
   def get_all_obj_keys(self):
     return self.obj_infos.keys()
 
+  def gen_class_info_strs(self):
+    strs = []
+    for class_id, class_info in self.class_infos.items():
+      clss_str = "%d,%s,%d" % (class_id, class_info['class_name'], class_info['present'])
+      strs.append(clss_str)
+    return strs
+
+  def gen_obj_info_strs(self):
+    strs = []
+    for obj_key, obj_info in self.obj_infos.items():
+      obj_str = "%d,%s,%d,%d,%f,%f,%f,%f" % (obj_key[1], obj_info['class_name'], obj_key[0], \
+                                             obj_info['present'], obj_info['coords'][0], \
+                                             obj_info['coords'][1], obj_info['coords'][2], \
+                                             obj_info['coords'][3])
+      strs.append(obj_str)
+    return strs
   def verify(self):
     # verify all the coordinates
     for obj_key, obj_info in self.obj_infos.items():
@@ -97,13 +115,21 @@ class Video(object):
   def __init__(self, yt_id, dl_path, train_or_val):
     self.yt_id    = yt_id
     self.dwnld_path = dl_path
+
     self.train_or_val = train_or_val
     self.start_ts = float('Inf')
     self.stop_ts  = -float('Inf')
+    self.fps = -1
+    self.num_frames = -1
+    self.width = -1
+    self.height = -1
     self.frame_annos = {}
 
   def get_download_dir(self):
     return self.dwnld_path
+
+  def get_yt_id(self):
+    return self.yt_id
 
   def vid_filename(self):
     return self.yt_id + '_temp.mp4'
@@ -163,6 +189,10 @@ class Video(object):
       clips.append(clip)
     return clips
 
+  def get_clip_filename(self, clip):
+    return "%s__%.3f--%.3f.mp4" % \
+            (self.yt_id, float(clip['start_ts']), float(clip['end_ts']))
+
   def get_num_clips(self):
     return len(self.gen_all_ts_groups())
 
@@ -185,45 +215,188 @@ class Video(object):
   def is_train(self):
     return self.train_or_val == "train"
 
+  def set_vid_info(self, vid_info):
+    self.fps = vid_info['fps']
+    self.num_frames = vid_info['num_frames']
+    self.width = vid_info['width']
+    self.height = vid_info['height']
+
+def get_vid_info(vid_fp):
+  """Gets information about a video using ffprobe:
+  1. Get location of iframes
+  2. get number of frames
+  3. height/width of frames
+  """
+  vid_info = {}
+  err_fd = tempfile.TemporaryFile()
+  check_call(["ffmpeg", "-i", vid_fp, \
+                        "-vf", r'select=eq(pict_type\,PICT_TYPE_I)', \
+                        "-vsync", "2", "-f", "null", "NUL", \
+                        "-loglevel", "debug"], stderr=err_fd)
+  # check_call(["ffprobe", "-select_streams", "v:0", \
+  #                   "-show_frames", "-show_entries", \
+  #                   "frame=pict_type", "-of", "csv", vid_fp],
+  #          stdout=out_fd, stderr=err_fd)
+
+  err_fd.seek(0)
+  err = err_fd.read()
+  err_fd.close()
+
+  matches = re.findall(r"pict_type:(\S+)", err)
+  vid_info['num_frames'] = len(matches)
+  vid_info['iframes'] = [i for i, f in enumerate(matches) if f == 'I']
+
+  for line in err.splitlines():
+    vid_line = re.search(r"\s+Stream.*Video", line)
+    if vid_line:
+      # get fps
+      fps = re.findall(r"(\d+(?:\.\d+)?) fps", line)
+      assert len(fps) == 1, "Can't find fps for " + vid_fp
+      vid_info['fps'] = float(fps[0])
+      # get height/width
+      hw = re.findall(r"([1-9]\d*)x([1-9]\d+)", line)
+      assert len(hw) >= 1, "Can't find WxH for " + vid_fp
+      vid_info['width'] = int(hw[0][0])
+      vid_info['height'] = int(hw[0][1])
+      break
+  return vid_info
+
+
+def adjust_clip(clip, vid_info, clip_info):
+  start_fn = clip['start_ts'] / 1000.0
+  start_fn = int(start_fn * vid_info['fps'])
+
+  # search for this start_fn in iframes
+  sel_iframe = len(vid_info["iframes"]) - 1
+  for i in range(len(vid_info["iframes"]) - 1):
+    if vid_info["iframes"][i] <= start_fn and start_fn < vid_info["iframes"][i+1]:
+      sel_iframe = i
+      break
+
+  # find timestamp for iframe
+  iframe_start_sec = float(vid_info["iframes"][sel_iframe]) / vid_info['fps']
+
+  clip_info['start_keyframe_num'] = vid_info["iframes"][sel_iframe]
+  clip_info['start_msec'] = iframe_start_sec * 1000
+  clip_info['end_msec'] = clip['end_ts']
+
 
 # Download and cut a clip to size
 def dl_and_cut(vid):
-  d_dir = vid.get_download_dir()
-  vid_fp = os.path.join(d_dir, vid.vid_filename())
+  err_msg = ""
+  vid_info = None
+  try:
+    d_dir = vid.get_download_dir()
+    vid_fp = os.path.join(d_dir, vid.vid_filename())
+    clips = vid.gen_all_clips()
+    clip_infos = []
+
+    # Use youtube_dl to download the video
+    FNULL = open(os.devnull, 'w')
+    dwnld_cmd = [yt_dl_path, \
+                 #'--no-progress', \
+                 '-f', 'best[ext=mp4]', \
+                 '-o', vid_fp, \
+                  vid.get_yt_link()]
+    # print(dwnld_cmd)
+    check_call(dwnld_cmd, stdout=FNULL, stderr=subprocess.STDOUT)
+
+    if os.path.exists(vid_fp):
+      # get info about the video
+      vid_info = get_vid_info(vid_fp)
+      # vid_info2 = get_vid_info_old(vid_fp)
+      # if vid_info != vid_info2:
+      #   raise Exception("video infos are different")
+      # break the video into clips
+      for clip in clips:
+        clip_info = {}
+        # adjust the clip timing according to key-frames
+        adjust_clip(clip, vid_info, clip_info)
+
+        # get the information necessary for creating this clip
+        clip_fn = vid.get_clip_filename(clip)
+        clip_fp = os.path.join(d_dir, clip_fn)
+
+        start_sec = clip_info['start_msec'] / 1000
+        clip_secs = (clip_info['end_msec'] / 1000) - start_sec
+
+        clip_info['filename'] = clip_fn
+        clip_info['est_num_frames'] = int(clip_secs * vid_info['fps'])
+
+        # use ffmpeg to clip the video without re-encoding
+        err_fd = tempfile.TemporaryFile()
+        cmd = ["ffmpeg", "-ss", "%.6f"%start_sec, "-i", vid_fp,
+               "-t", "%.6f"%clip_secs, "-c", "copy", clip_fp, "-y"]
+        check_call(cmd, stderr=err_fd)
+
+        err_fd.seek(0)
+        err = err_fd.read()
+        err_fd.close()
+
+        # adjust estimated number of frames from the output of ffmpeg
+        match = re.findall(r"frame=\s+(\d+)\s+fps", err)
+        if match:
+          clip_info['est_num_frames'] = \
+            min(clip_info['est_num_frames'], int(match[0]))
+
+        clip_infos.append(clip_info)
+
+    # Remove the main video (since we have the clips)
+    os.remove(vid_fp)
+  except Exception, e:
+    err_msg = str(e)
+
+  return vid.get_yt_id(), err_msg, vid_info, clip_infos
+
+
+def write_info_to_file(fd, vid, clip_infos):
+  """This function writes information about all annotation information related
+  to a video to the file descriptor fd. This includes all the information
+  about clips produced from this video, and the annotations the reside in that
+  clip. This crucially writes time offsets and fps for each clip/video.
+  """
+  # write video level information
+  fd.write("YTID:%s %s %dx%d %d %.2f \n" % (vid.get_yt_id(), \
+                                       vid.train_or_val, \
+                                       vid.height, vid.width, \
+                                       vid.num_frames, \
+                                       vid.fps))
+  # write information about each clip
   clips = vid.gen_all_clips()
+  assert len(clip_infos) == len(clips), "Inconsistent number of clip " + vid.get_yt_id()
+  for i, clip in enumerate(clips):
+    clip_info = clip_infos[i]
+    # first write information about this clip
+    fd.write("\t%s %.2f %.2f %d %d\n" % (clip_info['filename'], \
+                                         clip_info['start_msec'], \
+                                         clip_info['end_msec'], \
+                                         clip_info['est_num_frames'], \
+                                         clip_info['start_keyframe_num']))
+    assert clip_info['start_msec'] <= clip['start_ts'] and \
+           clip_info['end_msec'] >= clip['end_ts'], \
+           "Mismatched clip timings " + vid.get_yt_id()
+    clip_ts = clip['clip_annos'].keys()
+    clip_ts = sorted(clip_ts)
+    for ts in clip_ts:
+      assert clip_info['start_msec'] <= ts and \
+             clip_info['end_msec'] >= ts, \
+             "Mismatched frame timings " + vid.get_yt_id()
 
-  # Use youtube_dl to download the video
-  FNULL = open(os.devnull, 'w')
-  dwnld_cmd = [yt_dl_path, \
-               #'--no-progress', \
-               '-f', 'best[ext=mp4]', \
-               '-o', vid_fp, \
-                vid.get_yt_link()]
-  # print(dwnld_cmd)
-  check_call(dwnld_cmd, stdout=FNULL, stderr=subprocess.STDOUT)
+      class_strs = clip['clip_annos'][ts].gen_class_info_strs()
+      for class_str in class_strs:
+        fd.write("\t\tCLASS:%d,%s\n" % (ts, class_str))
 
-  # for clip in clips:
-  #   # Verify that the video has been downloaded. Skip otherwise
-  #   if os.path.exists(vid_fp):
-  #     # Cut out the clip within the downloaded video and save the clip
-  #     # in the correct class directory. Note that the -ss argument coming
-  #     # first tells ffmpeg to start off with an I frame (no frozen start)
-  #     check_call(['ffmpeg',\
-  #       '-ss', str(float(clip.start)/1000),\
-  #       '-i','file:'+d_set_dir+'/'+vid.yt_id+'_temp.mp4',\
-  #       '-t', str((float(clip.start)+float(clip.stop))/1000),\
-  #       '-c','copy',class_dir+'/'+clip.name+'.mp4'],
-  #       stdout=FNULL,stderr=subprocess.STDOUT )
+      obj_strs = clip['clip_annos'][ts].gen_obj_info_strs()
+      for obj_str in obj_strs:
+        fd.write("\t\tOBJ:%d,%s\n" % (ts, obj_str))
 
-  # # Remove the temporary video
-  # os.remove(vid_fp)
+  fd.flush()
 
 
 # Parse the annotation csv file and schedule downloads and cuts
 def parse_and_dwnld_vids(args):
   """Download the entire youtube-bb data set into `dl_dir`.
   """
-
   dl_dir = args.downloaddir
   num_threads = args.numthreads
 
@@ -293,16 +466,18 @@ def parse_and_dwnld_vids(args):
 
       if (class_or_det == 'class'):
         class_id = anno[2]
+        class_name = anno[3]
         obj_presence = anno[4]
         obj_presence = obj_presence == "present"
-        videos[yt_id].add_class_info(timetamp, class_id, obj_presence)
+        videos[yt_id].add_class_info(timetamp, class_id, class_name, obj_presence)
       elif (class_or_det == 'det'):
         class_id = anno[2]
+        class_name = anno[3]
         obj_id = anno[4]
         obj_presence = anno[5]
         obj_presence = obj_presence == "present"
         coords = anno[6:]
-        videos[yt_id].add_obj_info(timetamp, class_id, obj_presence, obj_id, *coords)
+        videos[yt_id].add_obj_info(timetamp, class_id, class_name, obj_presence, obj_id, *coords)
 
   print("Number of videos: %d" % len(videos))
 
@@ -332,15 +507,29 @@ def parse_and_dwnld_vids(args):
   for yt_id, vid in videos.items():
     vid.check_all_infos()
 
+  fd = open("dwnld_youtubebb", "w+")
+  fd_err = open("dwnld_youtubebb_err", "w+")
+
   # Download and cut in parallel threads giving
   with futures.ProcessPoolExecutor(max_workers=num_threads) as executor:
     fs = [executor.submit(dl_and_cut, vid) for yt_id, vid in videos.items()]
     for i, f in enumerate(futures.as_completed(fs)):
-      # Write progress to error so that it can be seen
+      ret_yt_id, err_msg, vid_info, clip_infos = f.result()
+      if err_msg:
+        fd_err.write("YTID:%s failed: %s\n" % (ret_yt_id, str(err_msg)))
+        fd_err.flush()
+      else:
+        videos[ret_yt_id].set_vid_info(vid_info)
+        write_info_to_file(fd, videos[ret_yt_id], clip_infos)
+
+      # Write progress to stderr so far
       sys.stderr.write( \
         "Downloaded video: {} / {} \r".format(i, len(videos)))
 
   print('All videos (%d) downloaded' % len(videos))
+
+  fd.close()
+  fd_err.close()
 
 
 if __name__ == '__main__':
@@ -356,7 +545,7 @@ if __name__ == '__main__':
   parser.add_argument("-t", "--numthreads", type=int, metavar="NUMTHREADS",
                        default=4,
                        help="Number of threads to use for parallel downloading")
-  parser.add_argument("-p", "--prctdwnld", type=int, metavar="PERCENTAGEDWNLD",
+  parser.add_argument("-p", "--prctdwnld", type=float, metavar="PERCENTAGEDWNLD",
                        default=100,
                        help="Percentage of the dataset to download")
   parser.add_argument("-s", "--split_time_th", type=int, default=3000,
