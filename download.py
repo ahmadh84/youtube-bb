@@ -17,19 +17,12 @@
 #
 ########################################################################
 
-# from __future__ import unicode_literals
-# import imageio
-# from ffmpy import FFmpeg
 from subprocess import check_call
 from concurrent import futures
-# from random import shuffle
 import subprocess
-# import youtube_dl
-# import socket
 import os
 import argparse
 import collections
-# import io
 import sys
 import csv
 import tempfile
@@ -98,6 +91,7 @@ class FrameAnnosInfo(object):
                                              obj_info['coords'][3])
       strs.append(obj_str)
     return strs
+
   def verify(self):
     # verify all the coordinates
     for obj_key, obj_info in self.obj_infos.items():
@@ -105,6 +99,12 @@ class FrameAnnosInfo(object):
       checks = [c == -1 or (c >= 0 and c <= 1) for c in coords]
       if not (coords[0] <= coords[1] and coords[2] <= coords[3] and sum(checks)==4):
         raise Exception("Object '%s' %s (%d) has invalid coords (%s)" % (str(obj_key), self.yt_id, self.timestamp, str(coords)))
+
+  def num_class_annos(self):
+    return len(self.class_infos)
+
+  def num_obj_annos(self):
+    return len(self.obj_infos)
 
   def get_ts(self):
     return self.timestamp
@@ -201,6 +201,14 @@ class Video(object):
 
   def num_anno_frames(self):
     return len(self.frame_annos)
+
+  def num_annos(self):
+    num_class_annos = 0
+    num_obj_annos = 0
+    for ts, frame_anno in self.frame_annos.items():
+      num_class_annos += frame_anno.num_class_annos()
+      num_obj_annos += frame_anno.num_obj_annos()
+    return num_class_annos, num_obj_annos
 
   def num_objs(self):
     all_obj_keys = []
@@ -355,6 +363,10 @@ def write_info_to_file(fd, vid, clip_infos):
   about clips produced from this video, and the annotations the reside in that
   clip. This crucially writes time offsets and fps for each clip/video.
   """
+  total_anno_frames = 0
+  total_class_annos = 0
+  total_obj_annos = 0
+
   # write video level information
   fd.write("YTID:%s %s %dx%d %d %.2f \n" % (vid.get_yt_id(), \
                                        vid.train_or_val, \
@@ -375,22 +387,47 @@ def write_info_to_file(fd, vid, clip_infos):
     assert clip_info['start_msec'] <= clip['start_ts'] and \
            clip_info['end_msec'] >= clip['end_ts'], \
            "Mismatched clip timings " + vid.get_yt_id()
+
     clip_ts = clip['clip_annos'].keys()
     clip_ts = sorted(clip_ts)
+    total_anno_frames += len(clip_ts)
+
     for ts in clip_ts:
       assert clip_info['start_msec'] <= ts and \
              clip_info['end_msec'] >= ts, \
              "Mismatched frame timings " + vid.get_yt_id()
 
       class_strs = clip['clip_annos'][ts].gen_class_info_strs()
+      total_class_annos += len(class_strs)
       for class_str in class_strs:
         fd.write("\t\tCLASS:%d,%s\n" % (ts, class_str))
 
       obj_strs = clip['clip_annos'][ts].gen_obj_info_strs()
+      total_obj_annos += len(obj_strs)
       for obj_str in obj_strs:
         fd.write("\t\tOBJ:%d,%s\n" % (ts, obj_str))
 
   fd.flush()
+
+  # double check the number of annotations
+  n_anno_frames = vid.num_anno_frames()
+  if n_anno_frames != total_anno_frames:
+    err_msg = "Number of annotated frame inconsistent: " + vid.get_yt_id()
+    sys.stderr.write(err_msg)
+    sys.stderr.flush()
+    raise Exception(err_msg)
+
+  n_clss, n_objs = vid.num_annos()
+  if n_clss != total_class_annos:
+    err_msg = "Number of class annotations inconsistent: " + vid.get_yt_id()
+    sys.stderr.write(err_msg)
+    sys.stderr.flush()
+    raise Exception(err_msg)
+  if n_objs != total_obj_annos:
+    err_msg = "Number of object annotations inconsistent: " + vid.get_yt_id()
+    sys.stderr.write(err_msg)
+    sys.stderr.flush()
+    raise Exception(err_msg)
 
 
 # Parse the annotation csv file and schedule downloads and cuts
@@ -417,39 +454,36 @@ def parse_and_dwnld_vids(args):
 
     if not os.path.isfile(csv_path):
       # Download & extract the annotation list
-      print (d_set+': Downloading annotations...')
+      print(d_set+': Downloading annotations...')
       check_call(['wget', web_host+d_set+'.csv.gz'])
-      print (d_set+': Unzipping annotations...')
+      print(d_set+': Unzipping annotations...')
       check_call(['gzip', '-d', '-f', d_set+'.csv.gz'])
 
       os.rename(d_set+'.csv', csv_path)
 
-    if ('classification' in d_set):
+    if 'classification' in d_set:
       class_or_det = 'class'
-    elif ('detection' in d_set):
+    elif 'detection' in d_set:
       class_or_det = 'det'
     else:
       raise Exception("Unknown csv type '%s'" % d_set)
 
-    if ('train' in d_set):
+    if 'train' in d_set:
       train_or_val = 'train'
       is_train = True
-    elif ('validation' in d_set):
+    elif 'validation' in d_set:
       train_or_val = 'val'
       is_train = False
     else:
       raise Exception("Unknown train/val type '%s'" % d_set)
 
-    print (csv_path+': Parsing file ...')
+    print(csv_path+': Parsing file ...')
     # Parse csv data
     with open(csv_path, 'rt') as f:
       reader      = csv.reader(f)
       annotations = list(reader)
 
-    # print(annotations[0])
-    # print(annotations[-1])
-
-    print (csv_path+': Inserting in videos dict ...')
+    print(csv_path+': Inserting in videos dict ...')
 
     # Parse all the annotation lines in this file - adding class or detection
     # information to Video objects in videos
@@ -479,9 +513,9 @@ def parse_and_dwnld_vids(args):
         coords = anno[6:]
         videos[yt_id].add_obj_info(timetamp, class_id, class_name, obj_presence, obj_id, *coords)
 
-  print("Number of videos: %d" % len(videos))
+  print("Number of total videos: %d" % len(videos))
 
-  # delete some videos if prctdwnld given
+  # only download a certain percentage of videos if prctdwnld given
   if args.prctdwnld < 100:
     all_vid_keys = videos.keys()
     num_del = int(len(all_vid_keys) * (100-args.prctdwnld)/100.0)
@@ -491,6 +525,24 @@ def parse_and_dwnld_vids(args):
       del videos[vid]
     print("%d videos remain after removing %.2f%% videos" % (len(videos), 100-args.prctdwnld))
 
+  # remove videos which have already been downloaded 
+  # (according to args.check_dwnld)
+  if args.check_dwnld and os.path.exists(args.check_dwnld):
+    with open(args.check_dwnld, 'r') as fd:
+      # find all videos that have been downloaded according to this log file
+      dwnld_log = fd.read()
+      dwnld_yt_ids = re.findall('YTID:(\S+)', dwnld_log)
+      num_del = 0
+      # remove from the download video list, if it has already been downloaded
+      for yt_id in dwnld_yt_ids:
+        if yt_id in videos:
+          del videos[yt_id]
+          num_del += 1
+      print("%d videos remain after removing %d videos which have already "
+            "been downloaded according to '%s'" % 
+            (len(videos), num_del, args.check_dwnld))
+
+  # print some stats of the videos that will be downloaded
   all_num_annos = [vid.num_anno_frames() for _, vid in videos.items()]
   avg_annos = sum(all_num_annos) / float(len(videos))
   print("Avg. number of annotated frames: %.2f [%d, %d]" % (avg_annos, min(all_num_annos), max(all_num_annos)))
@@ -507,24 +559,31 @@ def parse_and_dwnld_vids(args):
   for yt_id, vid in videos.items():
     vid.check_all_infos()
 
-  fd = open("dwnld_youtubebb", "w+")
-  fd_err = open("dwnld_youtubebb_err", "w+")
+  # file to which all annotation information for all clips will be written
+  fd = open(args.log_filename, "w+")
+  # file to which all video downloading errors are written to
+  fd_err = open(args.log_filename + "_err", "w+")
 
-  # Download and cut in parallel threads giving
+  # Download videos and create clips in parallel processes
   with futures.ProcessPoolExecutor(max_workers=num_threads) as executor:
     fs = [executor.submit(dl_and_cut, vid) for yt_id, vid in videos.items()]
     for i, f in enumerate(futures.as_completed(fs)):
+      # get result from dl_and_cut(vid)
       ret_yt_id, err_msg, vid_info, clip_infos = f.result()
       if err_msg:
+        # if error, write error to file
         fd_err.write("YTID:%s failed: %s\n" % (ret_yt_id, str(err_msg)))
         fd_err.flush()
       else:
+        # update video info from the vid_info returned
         videos[ret_yt_id].set_vid_info(vid_info)
+        # write video/clip info and annotations to args.log_filename
         write_info_to_file(fd, videos[ret_yt_id], clip_infos)
 
       # Write progress to stderr so far
       sys.stderr.write( \
         "Downloaded video: {} / {} \r".format(i, len(videos)))
+      sys.stderr.flush()
 
   print('All videos (%d) downloaded' % len(videos))
 
@@ -557,6 +616,13 @@ if __name__ == '__main__':
   parser.add_argument("-e", "--end_gap", type=int, default=1000,
                        help="this is the ending gap (in ms) that needs to be put in "
                             "after the last annotation in a clip.")
+  parser.add_argument("-f", "--log_filename", type=str, default="dwnld_youtubebb",
+                       help="This is the prefix of the filename where all information "
+                            "about videos (and their clips) downloaded are written to.")
+  parser.add_argument("-c", "--check_dwnld", type=str, default=None,
+                       help="If a filename is indicated, it is used to check what "
+                            "videos have already been downloaded - and hence "
+                            "shouldn't be downloaded again")
 
   args = parser.parse_args()
 
