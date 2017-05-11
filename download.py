@@ -20,6 +20,7 @@
 from subprocess import check_call
 from concurrent import futures
 import subprocess
+import threading
 import os
 import argparse
 import collections
@@ -286,6 +287,7 @@ def adjust_clip(clip, vid_info, clip_info):
 
   clip_info['start_keyframe_num'] = vid_info["iframes"][sel_iframe]
   clip_info['start_msec'] = iframe_start_sec * 1000
+  clip['start_ts'] = clip_info['start_msec']
   clip_info['end_msec'] = clip['end_ts']
 
 
@@ -337,15 +339,18 @@ def dl_and_cut(vid):
                "-t", "%.6f"%clip_secs, "-c", "copy", clip_fp, "-y"]
         check_call(cmd, stderr=err_fd)
 
-        err_fd.seek(0)
-        err = err_fd.read()
+        # err_fd.seek(0)
+        # err = err_fd.read()
         err_fd.close()
 
         # adjust estimated number of frames from the output of ffmpeg
-        match = re.findall(r"frame=\s+(\d+)\s+fps", err)
-        if match:
-          clip_info['est_num_frames'] = \
-            min(clip_info['est_num_frames'], int(match[0]))
+        # match = re.findall(r"frame=\s+(\d+)\s+fps", err)
+        # if match:
+        #   clip_info['est_num_frames'] = \
+        #     min(clip_info['est_num_frames'], int(match[0]))
+
+        vid_info2 = get_vid_info(clip_fp)
+        clip_info['est_num_frames'] = vid_info2['num_frames']
 
         clip_infos.append(clip_info)
 
@@ -564,28 +569,37 @@ def parse_and_dwnld_vids(args):
   # file to which all video downloading errors are written to
   fd_err = open(args.log_filename + "_err", "w+")
 
+  succeed_dwnld = 0
+  failed_dwnld = 0
+
+  lock = threading.Lock()
+
   # Download videos and create clips in parallel processes
   with futures.ProcessPoolExecutor(max_workers=num_threads) as executor:
     fs = [executor.submit(dl_and_cut, vid) for yt_id, vid in videos.items()]
     for i, f in enumerate(futures.as_completed(fs)):
-      # get result from dl_and_cut(vid)
-      ret_yt_id, err_msg, vid_info, clip_infos = f.result()
-      if err_msg:
-        # if error, write error to file
-        fd_err.write("YTID:%s failed: %s\n" % (ret_yt_id, str(err_msg)))
-        fd_err.flush()
-      else:
-        # update video info from the vid_info returned
-        videos[ret_yt_id].set_vid_info(vid_info)
-        # write video/clip info and annotations to args.log_filename
-        write_info_to_file(fd, videos[ret_yt_id], clip_infos)
+      with lock:
+        # get result from dl_and_cut(vid)
+        ret_yt_id, err_msg, vid_info, clip_infos = f.result()
+        if err_msg:
+          # if error, write error to file
+          fd_err.write("YTID:%s failed: %s\n" % (ret_yt_id, str(err_msg)))
+          fd_err.flush()
+          failed_dwnld += 1
+        else:
+          # update video info from the vid_info returned
+          videos[ret_yt_id].set_vid_info(vid_info)
+          # write video/clip info and annotations to args.log_filename
+          write_info_to_file(fd, videos[ret_yt_id], clip_infos)
+          succeed_dwnld += 1
 
-      # Write progress to stderr so far
-      sys.stderr.write( \
-        "Downloaded video: {} / {} \r".format(i, len(videos)))
-      sys.stderr.flush()
+        # Write progress to stderr so far
+        sys.stderr.write( \
+          "Downloaded video: {} / {} \r".format(i, len(videos)))
+        sys.stderr.flush()
 
-  print('All videos (%d) downloaded' % len(videos))
+  print('Attempted to download %d videos = %d successed, %d failed' \
+          % (len(videos), succeed_dwnld, failed_dwnld))
 
   fd.close()
   fd_err.close()
